@@ -1,0 +1,202 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Presigned URLs vs Multipart</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  :root { --ink:#1a1a2e; --muted:#5b6172; --line:#e3e6ee; --accent:#2b5cff; --bg-code:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); max-width: 860px; margin: 0 auto; padding: 36px 40px;
+  }
+  h1 { font-size: 26px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  h2 { font-size: 20px; margin-top: 34px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 22px; }
+  blockquote {
+    margin: 14px 0; padding: 10px 16px; background: #eef3ff;
+    border-left: 4px solid var(--accent); border-radius: 4px; color: var(--ink);
+  }
+  blockquote p { margin: 4px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f1f4fb; }
+  tr:nth-child(even) td { background: #fafbfe; }
+  code { font-family: "SF Mono", "Fira Code", Consolas, monospace; font-size: 12.5px;
+         background: var(--bg-code); padding: 1px 5px; border-radius: 4px; }
+  pre.code { background: var(--bg-code); border: 1px solid var(--line); border-radius: 8px;
+             padding: 14px 16px; overflow-x: auto; }
+  pre.code code { background: none; padding: 0; font-size: 12px; line-height: 1.5; }
+  pre.mermaid { text-align: center; margin: 18px 0; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 26px 0; }
+  a { color: var(--accent); }
+  @page { margin: 14mm; }
+  h2, h3 { break-after: avoid; }
+  pre, table, blockquote { break-inside: avoid; }
+</style>
+</head>
+<body>
+<h1>Secure Presigned Upload Flow — How We Close Every Gap</h1>
+<blockquote>
+<p><strong>Stack:</strong> React (frontend) · Spring Boot (backend) · Amazon S3 (storage)
+<strong>Goal of this doc:</strong> Show the <strong>full secure upload flow</strong> and prove that every concern raised — wrong-folder access, file validation, <strong>virus scan before the file is usable</strong>, trusting the browser, versioning, TLS, and <strong>audit log written to our own DB</strong> — is <strong>handled</strong>, step by step.</p>
+</blockquote>
+<hr>
+<h2>Key idea: scan in a quarantine bucket first</h2>
+<p>The file is <strong>never</strong> uploaded straight into the main bucket. It goes into a separate <strong>quarantine (staging) bucket</strong> first, gets <strong>scanned there</strong>, and <strong>only a clean file is moved to the main bucket</strong> and marked usable. So the main bucket only ever holds safe, scanned files. The audit log is written to <strong>our database</strong> by <strong>our backend&#39;s audit-log service</strong>, triggered by an S3 event via Lambda/SQS.</p>
+<hr>
+<h2>The Gaps and Their Fixes (at a glance)</h2>
+<table>
+<thead>
+<tr>
+<th>#</th>
+<th>Concern</th>
+<th>Fix in the presigned flow</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>1</td>
+<td>User could request a URL for another folder</td>
+<td>Backend builds the key + checks permission <strong>before</strong> signing</td>
+</tr>
+<tr>
+<td>2a</td>
+<td>No file size/type check</td>
+<td>Rules added to the signed link → S3 rejects bad files</td>
+</tr>
+<tr>
+<td>2b</td>
+<td>No virus scan</td>
+<td>File lands in a <strong>quarantine bucket</strong>, scanned <strong>before</strong> it&#39;s moved to the main bucket</td>
+</tr>
+<tr>
+<td>2c</td>
+<td>&quot;Upload done&quot; trusted from browser</td>
+<td>Backend verifies with <strong>HeadObject</strong> before accepting</td>
+</tr>
+<tr>
+<td>3a</td>
+<td>Versioning</td>
+<td>Turn on S3 bucket versioning</td>
+</tr>
+<tr>
+<td>3b</td>
+<td>TLS / HTTPS only</td>
+<td>Enforce <code>aws:SecureTransport</code> bucket policy</td>
+</tr>
+<tr>
+<td>3c</td>
+<td>Audit log</td>
+<td>S3 event → Lambda/SQS → <strong>our BE audit-log service → our DB</strong></td>
+</tr>
+</tbody></table>
+<p>✅ Every gap is closed. The file is scanned <strong>before</strong> it becomes usable, and the file itself never routes through the backend.</p>
+<hr>
+<h2>The Full Secure Flow (Diagram)</h2>
+<pre class="mermaid">sequenceDiagram
+    participant R as React (Browser)
+    participant B as Spring Boot Backend (+ Audit service + DB)
+    participant Q as S3 Quarantine bucket
+    participant V as Virus Scan (Lambda + ClamAV)
+    participant S as S3 Main bucket (private)
+
+    R->>B: 1. Ask to upload (file name, type, size, patientId)
+    Note over B: 2. CHECK permission + build key + validate type/size&lt;br/>save record as PENDING
+    B-->>R: 3. Presigned URL (to QUARANTINE bucket, size/type rules)
+    R->>Q: 4. Upload file DIRECTLY to quarantine (HTTPS only)
+    Note over Q: 5. S3 enforces size/type rules
+    Q-->>R: 6. Upload OK
+    R->>B: 7. Tell backend "done"
+    B->>Q: 8. HeadObject — verify file exists, size & type match
+    Q-->>B: 9. Confirmed
+    Q--)V: 10. New-file event → VIRUS SCAN (before file is usable)
+    alt File is CLEAN
+        V->>S: 11a. Move file to MAIN bucket
+        V--)B: 11b. Notify (Lambda/SQS) → audit-log service
+        B->>B: 11c. Write audit log to DB + mark record AVAILABLE
+    else File is INFECTED
+        V->>Q: 12a. Delete file from quarantine
+        V--)B: 12b. Notify → audit-log service
+        B->>B: 12c. Write audit log to DB + mark record BLOCKED
+    end</pre><hr>
+<h2>Step-by-Step in Plain Words</h2>
+<p><strong>Step 1 — React asks to upload.</strong>
+The user picks a file. React sends only the basics (file name, type, size, which patient) to Spring Boot. It does <strong>not</strong> decide where the file is stored.</p>
+<p><strong>Step 2 — Backend checks permission and builds the key.</strong> <em>(closes Gap 1)</em>
+Spring Boot reads the logged-in user&#39;s token and checks: <em>&quot;Is this user allowed to upload for this patient?&quot;</em></p>
+<ul>
+<li>If <strong>no</strong> → stop, return an error, give <strong>no URL</strong>.</li>
+<li>If <strong>yes</strong> → the backend itself builds the storage path (<code>tenant-id/patient-id/file</code>) and saves the record as <strong>PENDING</strong>. The browser never picks the folder, so it can never target someone else&#39;s.</li>
+</ul>
+<p><strong>Step 3 — Backend signs a URL with rules (pointing at the quarantine bucket).</strong> <em>(closes Gaps 2a + 2b)</em>
+The backend creates a short-lived presigned URL with <strong>rules</strong> (max size, allowed types) — but it points to the <strong>quarantine bucket</strong>, not the main one. So nothing reaches the real storage yet.</p>
+<p><strong>Step 4 — React uploads straight to the quarantine bucket over HTTPS.</strong> <em>(closes Gap 3b)</em>
+React uploads the file <strong>directly to the quarantine bucket</strong> using the signed URL. The bucket policy allows <strong>HTTPS only</strong>, so the transfer is always encrypted. The file never passes through the backend.</p>
+<p><strong>Step 5 — S3 enforces the size/type rules.</strong> <em>(closes Gap 2a)</em>
+If the file breaks the rules from Step 3, <strong>S3 rejects it</strong> — it&#39;s never stored.</p>
+<p><strong>Step 6 — Quarantine confirms the upload</strong> back to the browser.</p>
+<p><strong>Step 7 — React tells the backend &quot;done.&quot;</strong>
+We will <strong>not</strong> simply trust this message.</p>
+<p><strong>Step 8–9 — Backend verifies with HeadObject.</strong> <em>(closes Gap 2c)</em>
+The backend asks the quarantine bucket directly: <em>&quot;Does this file actually exist? Is its size and type correct?&quot;</em> (the HeadObject call). A lying or failed browser can&#39;t fake a successful upload.</p>
+<p><strong>Step 10 — Virus scan runs BEFORE the file is usable.</strong> <em>(closes Gap 2b)</em>
+The new file in the quarantine bucket fires an event that triggers a <strong>Lambda running ClamAV</strong>. The file is still in quarantine — <strong>no one can use it yet</strong> — so we check it <em>before</em> it ever reaches the main bucket.</p>
+<p><strong>Step 11 — If clean → move + audit + make available.</strong> <em>(closes Gap 3c)</em></p>
+<ul>
+<li><strong>11a:</strong> The Lambda <strong>moves the file to the main bucket</strong>.</li>
+<li><strong>11b:</strong> A Lambda/SQS event <strong>notifies our backend&#39;s audit-log service</strong>.</li>
+<li><strong>11c:</strong> The backend <strong>writes an audit entry in our DB</strong> (who, what, when, result) and marks the record <strong>AVAILABLE</strong>. Only now can the file be shown or downloaded.</li>
+</ul>
+<p><strong>Step 12 — If infected → delete + audit + block.</strong></p>
+<ul>
+<li><strong>12a:</strong> The file is <strong>deleted from quarantine</strong> (it never reaches the main bucket).</li>
+<li><strong>12b:</strong> A Lambda/SQS event <strong>notifies our audit-log service</strong>.</li>
+<li><strong>12c:</strong> The backend <strong>writes an audit entry in our DB</strong> and marks the record <strong>BLOCKED</strong>.</li>
+</ul>
+<hr>
+<h2>Two More Settings (set once on the bucket)</h2>
+<ul>
+<li><strong>Versioning</strong> <em>(closes Gap 3a):</em> turn on S3 bucket versioning so changed/deleted files can be recovered — important for compliance.</li>
+<li><strong>Private buckets:</strong> Block Public Access is on for <strong>both</strong> quarantine and main buckets, so the only way in/out is through our signed, short-lived URLs. A raw S3 link returns <strong>403 Forbidden</strong>.</li>
+</ul>
+<hr>
+<h2>Why This Still Beats Routing the File Through the Backend</h2>
+<p>The backend <strong>does</strong> talk to S3 in this flow (signing, HeadObject, audit) — but those are <strong>tiny control messages</strong>, not the file:</p>
+<table>
+<thead>
+<tr>
+<th>Backend ↔ S3 / Lambda here</th>
+<th>Size</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Sign URL</td>
+<td>a signature, no file traffic</td>
+</tr>
+<tr>
+<td>HeadObject</td>
+<td>a few KB of metadata</td>
+</tr>
+<tr>
+<td>Audit notification</td>
+<td>automatic, tiny event</td>
+</tr>
+</tbody></table>
+<p>The actual file (could be MBs or GBs) always goes <strong>browser → S3 directly</strong>, and is scanned in quarantine by Lambda — never moved through our server. Routing the file through the backend (<code>multipart/form-data</code> proxy) would push <strong>every byte</strong> through our server — the load we&#39;re avoiding. For very large files we&#39;d use <strong>presigned multipart</strong> (sign each part, still direct to S3).</p>
+<hr>
+<h2>Summary</h2>
+<p>✅ Wrong-folder access — backend builds key + checks permission
+✅ Size/type — rules on the signed link, enforced by S3
+✅ Virus scan — done in <strong>quarantine, before</strong> the file reaches the main bucket
+✅ Browser trust — backend verifies with HeadObject
+✅ Versioning — S3 setting
+✅ TLS/HTTPS — bucket policy
+✅ Audit log — S3 event → Lambda/SQS → <strong>our BE audit-log service → our DB</strong></p>
+<p><strong>Every gap is closed, the file is scanned before it&#39;s usable, the audit log lives in our own DB — and the file still uploads directly to S3, so we keep the security <em>and</em> the scalability.</strong></p>
+
+</body>
+</html>

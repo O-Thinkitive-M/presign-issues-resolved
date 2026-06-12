@@ -1,0 +1,161 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Presigned URLs vs Multipart</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<script>
+  mermaid.initialize({ startOnLoad: true, theme: "default", securityLevel: "loose" });
+</script>
+<style>
+  :root { --ink:#1a1a2e; --muted:#5b6172; --line:#e3e6ee; --accent:#2b5cff; --bg-code:#f6f8fa; }
+  * { box-sizing: border-box; }
+  body {
+    font: 15px/1.6 -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    color: var(--ink); max-width: 860px; margin: 0 auto; padding: 36px 40px;
+  }
+  h1 { font-size: 26px; border-bottom: 3px solid var(--accent); padding-bottom: 10px; }
+  h2 { font-size: 20px; margin-top: 34px; border-bottom: 1px solid var(--line); padding-bottom: 6px; }
+  h3 { font-size: 16px; margin-top: 22px; }
+  blockquote {
+    margin: 14px 0; padding: 10px 16px; background: #eef3ff;
+    border-left: 4px solid var(--accent); border-radius: 4px; color: var(--ink);
+  }
+  blockquote p { margin: 4px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 14px 0; font-size: 13.5px; }
+  th, td { border: 1px solid var(--line); padding: 7px 10px; text-align: left; vertical-align: top; }
+  th { background: #f1f4fb; }
+  tr:nth-child(even) td { background: #fafbfe; }
+  code { font-family: "SF Mono", "Fira Code", Consolas, monospace; font-size: 12.5px;
+         background: var(--bg-code); padding: 1px 5px; border-radius: 4px; }
+  pre.code { background: var(--bg-code); border: 1px solid var(--line); border-radius: 8px;
+             padding: 14px 16px; overflow-x: auto; }
+  pre.code code { background: none; padding: 0; font-size: 12px; line-height: 1.5; }
+  pre.mermaid { text-align: center; margin: 18px 0; }
+  hr { border: none; border-top: 1px solid var(--line); margin: 26px 0; }
+  a { color: var(--accent); }
+  @page { margin: 14mm; }
+  h2, h3 { break-after: avoid; }
+  pre, table, blockquote { break-inside: avoid; }
+</style>
+</head>
+<body>
+<h1>Document Uploads — Presigned URLs vs Multipart</h1>
+<blockquote>
+<p><strong>Stack:</strong> React (frontend) · Spring Boot (backend) · Amazon S3 (storage)
+<strong>In one line:</strong> The browser uploads the file <strong>straight to S3</strong>. Spring Boot only hands out a short-lived, signed link and keeps the bucket private. This is faster, cheaper, and scales better than pushing every file through your server.</p>
+</blockquote>
+<hr>
+<h2>1. What Is a Presigned URL?</h2>
+<p>A presigned URL is a <strong>temporary, signed link</strong> that Spring Boot creates using its AWS credentials. It allows <strong>one specific action</strong> (like &quot;upload this one file&quot;) for a <strong>short time</strong> (for example 5 minutes), and then it expires.</p>
+<table>
+<thead>
+<tr>
+<th>The URL contains</th>
+<th>The URL does <strong>NOT</strong> contain</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>Access Key ID, Signature, Expiry, the exact file path + action</td>
+<td>Secret Key, IAM credentials, account access</td>
+</tr>
+</tbody></table>
+<p>So even if someone sees the link, they <strong>cannot</strong> browse the bucket, list files, open other files, or delete anything. They can only do the single signed action — and only until it expires.</p>
+<hr>
+<h2>2. The Flow (React → Spring Boot → S3)</h2>
+<pre class="mermaid">sequenceDiagram
+    participant R as React (Browser)
+    participant B as Spring Boot Backend
+    participant S as Amazon S3 (private)
+
+    R->>B: 1. Ask for permission to upload (file name, type, size)
+    Note over B: checks login + file type / size
+    B-->>R: 2. Sends back a short-lived presigned URL
+    R->>S: 3. Uploads the file directly to S3
+    S-->>R: 4. Upload OK
+    R->>B: 5. Tells backend "done", backend saves the file info</pre><h3>Step-by-step in plain words</h3>
+<ol>
+<li><p><strong>React asks for permission.</strong> When the user picks a file, the React app sends the file&#39;s name, type, and size to Spring Boot and asks &quot;can I upload this?&quot;</p>
+</li>
+<li><p><strong>Spring Boot checks and signs.</strong> Spring Boot makes sure the user is logged in and that the file type and size are allowed. If everything is fine, it creates a short-lived presigned URL and sends it back to React. The file itself never touches the backend.</p>
+</li>
+<li><p><strong>React uploads straight to S3.</strong> Using that presigned URL, the React app sends the file <strong>directly to Amazon S3</strong>. Your server is not in the middle, so it stays fast and lightweight.</p>
+</li>
+<li><p><strong>S3 stores the file.</strong> Amazon S3 receives the file, stores it safely in the private bucket, and returns a success response to the browser.</p>
+</li>
+<li><p><strong>React confirms, Spring Boot saves the info.</strong> React tells Spring Boot the upload finished. The backend records the file details (file name, where it lives in S3) so it can be shown or downloaded later.</p>
+</li>
+</ol>
+<hr>
+<h2>3. Reading and Deleting Files</h2>
+<ul>
+<li><p><strong>Download (Read):</strong> When a user wants to view a file, React asks the backend, and Spring Boot returns a short-lived download link to S3. The link works for a few minutes and then expires, so files are never permanently public.</p>
+</li>
+<li><p><strong>Delete:</strong> Deleting is done <strong>by the backend</strong>, not the browser. React asks Spring Boot to delete a file, the backend checks the user is allowed, and then it tells S3 to remove it.</p>
+</li>
+</ul>
+<hr>
+<h2>4. Why Presigned URLs Are Better Than Uploading Through the Backend</h2>
+<p>If every file goes <strong>browser → Spring Boot → S3</strong>, the file travels twice and your server does all the heavy lifting:</p>
+<ul>
+<li><strong>Double the network use</strong> — a 50 MB file means 100 MB moved. With 100 users that&#39;s 10 GB through your server.</li>
+<li><strong>Heavy backend load</strong> — every upload uses your server&#39;s CPU, memory, and bandwidth.</li>
+<li><strong>Hard to scale</strong> — more users means more servers just to move files.</li>
+<li><strong>Slow for far-away users</strong> — the file has to detour through your server before reaching S3.</li>
+<li><strong>Struggles with big files</strong> — large videos or scans can overwhelm the server.</li>
+<li><strong>Higher cost</strong> — you pay for all that extra traffic and compute.</li>
+</ul>
+<p>With presigned URLs, uploads go <strong>straight to S3</strong>, your backend stays small and fast, and it still fully controls who is allowed to upload.</p>
+<hr>
+<h2>5. Presigned URL vs Multipart Upload</h2>
+<table>
+<thead>
+<tr>
+<th>Attribute</th>
+<th>Presigned URL (direct upload)</th>
+<th>Multipart Upload</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>How it works</strong></td>
+<td>Backend signs one link, browser uploads once</td>
+<td>File split into parts: start → upload parts → finish</td>
+</tr>
+<tr>
+<td><strong>Simplicity</strong></td>
+<td>Very simple</td>
+<td>More steps to manage</td>
+</tr>
+<tr>
+<td><strong>Backend load</strong></td>
+<td>Almost none</td>
+<td>High if it goes through the server</td>
+</tr>
+<tr>
+<td><strong>Best file size</strong></td>
+<td>Up to 5 GB in one upload</td>
+<td>Designed for huge files (up to 5 TB)</td>
+</tr>
+<tr>
+<td><strong>Resume if it fails?</strong></td>
+<td>No — must upload again</td>
+<td>Yes — only the failed part is retried</td>
+</tr>
+<tr>
+<td><strong>Speed for big files</strong></td>
+<td>Good for normal docs</td>
+<td>Faster for very large files (parts upload in parallel)</td>
+</tr>
+<tr>
+<td><strong>Best for</strong></td>
+<td>Most documents (PDFs, images)</td>
+<td>Very large files (video, DICOM) or weak networks</td>
+</tr>
+</tbody></table>
+<p><strong>Simple rule:</strong> Use <strong>presigned URLs</strong> for almost everything. Use <strong>multipart</strong> only for very large files or shaky connections — and even then you can sign a link for each part to get the best of both.</p>
+<hr>
+<h2>Final Recommendation</h2>
+<p>For document uploads, use <strong>presigned URLs</strong>. The browser uploads directly to a <strong>private</strong> S3 bucket, Spring Boot stays in control of who can do what, costs stay low, and it scales easily. Keep multipart in your back pocket only for very large files.</p>
+
+</body>
+</html>
